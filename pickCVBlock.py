@@ -17,11 +17,29 @@
 
 
 
+import os
+import sys
+script_dir = os.path.dirname(os.path.abspath(__file__))
+for candidate_dir in [script_dir, os.path.dirname(script_dir)]:
+    lib_dir = os.path.join(candidate_dir, "lib")
+    if os.path.isdir(lib_dir) and candidate_dir not in sys.path:
+        sys.path.insert(0, candidate_dir)
+        break
+for root, dirs, files in os.walk(script_dir):
+    if "DobotDllType.py" in files:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        break
+
 import dobotArm
-import lib.DobotDllType as dType
+try:
+    import lib.DobotDllType as dType
+except ModuleNotFoundError:
+    import DobotDllType as dType
 import numpy as np
 import cv2
 import time
+import math
 
 
 """CONSTANTS"""
@@ -53,6 +71,113 @@ def pixel_to_robot(u, v, H):
     xy = H @ p
     xy /= xy[2]
     return xy[0], xy[1]
+
+
+# -----------------------------
+# HAND GESTURE DETECTION
+# -----------------------------
+
+pause_active = False
+pause_state_text = "Robot actions enabled"
+
+
+def get_skin_mask(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    lower_hsv = np.array([0, 30, 60], dtype=np.uint8)
+    upper_hsv = np.array([25, 150, 255], dtype=np.uint8)
+    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
+    return mask
+
+
+def find_largest_contour(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contours = [c for c in contours if cv2.contourArea(c) > 2000]
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+def count_hand_defects(contour):
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return 0
+    defects = cv2.convexityDefects(contour, hull)
+    if defects is None:
+        return 0
+    count = 0
+    for i in range(defects.shape[0]):
+        s, e, f, d = defects[i, 0]
+        start = tuple(contour[s][0])
+        end = tuple(contour[e][0])
+        far = tuple(contour[f][0])
+        a = np.linalg.norm(np.array(end) - np.array(start))
+        b = np.linalg.norm(np.array(far) - np.array(start))
+        c = np.linalg.norm(np.array(end) - np.array(far))
+        if b == 0 or c == 0:
+            continue
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (b * b + c * c - a * a) / (2 * b * c)))))
+        if angle < 90 and d > 2500:
+            count += 1
+    return count
+
+
+def detect_hand_gesture(frame):
+    global pause_active, pause_state_text
+    gesture_text = "No hand detected"
+    mask = get_skin_mask(frame)
+    contour = find_largest_contour(mask)
+    if contour is not None:
+        defects = count_hand_defects(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = float(w) / float(h) if h > 0 else 0
+        area = cv2.contourArea(contour)
+        if defects >= 4 and area > 7000:
+            gesture_text = "Open Palm"
+        elif defects <= 1 and aspect_ratio > 1.3 and area > 3500:
+            gesture_text = "Thumb Out"
+        else:
+            gesture_text = "Hand detected"
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
+        cv2.drawContours(frame, [hull], -1, (255, 0, 0), 2)
+    if pause_active:
+        if gesture_text == "Thumb Out":
+            pause_active = False
+            pause_state_text = "Robot actions resumed"
+            gesture_text = "Thumb Out detected - resuming"
+        else:
+            pause_state_text = "Robot actions paused"
+            gesture_text = "Robot paused - show Thumb Out"
+    elif gesture_text == "Open Palm":
+        pause_active = True
+        pause_state_text = "Robot actions paused"
+        gesture_text = "Open Palm detected - robot paused"
+    return gesture_text
+
+
+def wait_for_resume():
+    while pause_active:
+        success, frame = cap.read()
+        if not success:
+            continue
+        frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        gesture_text = detect_hand_gesture(frame)
+        cv2.putText(frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imshow("Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
 
 # State machine logic to control the flow of the program through the three phases: scanning for plates, scanning for targets, and executing pick/place operations.
@@ -94,7 +219,7 @@ def phase_detect_plates():
         current_list = []
         if circles is not None:
             circles = np.uint16(np.around(circles))
-            for i in circles[0, :]:
+            for i in circles[0, :] :
                 cv2.circle(display_frame, (i[0], i[1]), i[2], (0, 255, 0), 2)
                 rx, ry = pixel_to_robot(i[0], i[1], H_matrix)
                 current_list.append((rx, ry))
@@ -106,8 +231,12 @@ def phase_detect_plates():
             stability_counter = 0
             last_count = len(current_list)
 
+        gesture_text = detect_hand_gesture(display_frame)
+        cv2.putText(display_frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(display_frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         progress = int((stability_counter / STABILITY_LIMIT) * 100)
-        cv2.putText(display_frame, f"LOCKING PLATES: {progress}%", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(display_frame, f"LOCKING PLATES: {progress}%", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.imshow("Detection", display_frame)
         cv2.waitKey(1)
 
@@ -153,8 +282,6 @@ def phase_detect_targets():
                     # Draw on display_frame only
                     cv2.drawContours(display_frame, [cnt], -1, (0, 255, 0), 2)
                     
-        cv2.waitKey(1)
-
         # --- STABILITY LOGIC ---
         if len(current_list) != 0:
             if len(current_list) > 0 and len(current_list) == last_count:
@@ -163,13 +290,17 @@ def phase_detect_targets():
                 stability_counter = 0
                 last_count = len(current_list)
 
-        # Visual Feedback
+        gesture_text = detect_hand_gesture(display_frame)
+        cv2.putText(display_frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(display_frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         progress = int((stability_counter / STABILITY_LIMIT) * 100)
         color = (0, 255, 0) if progress < 100 else (255, 255, 0)
         
-        cv2.putText(display_frame, f"LOCKING TARGETS: {progress}%", (20, 40), 
+        cv2.putText(display_frame, f"LOCKING TARGETS: {progress}%", (20, 120), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         cv2.imshow("Detection", display_frame)
+        cv2.waitKey(1)
         
         # --- EXIT CONDITION ---
         if stability_counter >= STABILITY_LIMIT:
@@ -186,9 +317,6 @@ def phase_detect_targets():
 # Do you need collision avoidance? Think about if the robot gripper accidentally hits the plate or other parts on the way to the target, what would happen? How would you modify the robot's movement logic to avoid collisions?
 # ---------------------------------------------------------
 def phase_execute_batch(api, pick_list, drop_list):
-    cv2.VideoCapture(0)
-    time.sleep(0.5)
-    
     if len(pick_list) == 0 or len(drop_list) == 0:
         print("missing targets, aborting")
         return False
@@ -198,24 +326,30 @@ def phase_execute_batch(api, pick_list, drop_list):
     print(f"\n[PHASE 3] Executing batch of {batch_size} operations.")
 
     for i in range(batch_size):
+        wait_for_resume()
         pick_x, pick_y = pick_list[i]
         drop_x, drop_y = drop_list[i]
 
         print(f"Task {i+1}: Moving {pick_x, pick_y} to {drop_x, drop_y}")
 
         # --- PICK SEQUENCE ---
+        wait_for_resume()
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
+        wait_for_resume()
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
-        #optional alternate function call method to include a rotation of the gripper angle
-        #dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, 45) 
-
+        wait_for_resume()
         dobotArm.close_gripper(api)
+        wait_for_resume()
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         # --- PLACE SEQUENCE ---
+        wait_for_resume()
         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+        wait_for_resume()
         dobotArm.open_gripper(api)
+        wait_for_resume()
         dobotArm.stop_pump(api)
+        wait_for_resume()
         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
 
     # irl, it is ok for 1 dish to contain multiple parts

@@ -1,5 +1,22 @@
+import os
+import sys
+script_dir = os.path.dirname(os.path.abspath(__file__))
+for candidate_dir in [script_dir, os.path.dirname(script_dir)]:
+    lib_dir = os.path.join(candidate_dir, "lib")
+    if os.path.isdir(lib_dir) and candidate_dir not in sys.path:
+        sys.path.insert(0, candidate_dir)
+        break
+for root, dirs, files in os.walk(script_dir):
+    if "DobotDllType.py" in files:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        break
+
 import dobotArm
-import lib.DobotDllType as dType
+try:
+    import lib.DobotDllType as dType
+except ModuleNotFoundError:
+    import DobotDllType as dType
 import time
 
 #Before running and commands, always run this

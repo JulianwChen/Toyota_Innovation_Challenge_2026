@@ -193,6 +193,8 @@ previous_time = 0
 
 print("Camera started. Press 'q' to quit.")
 
+pause_active = False
+pause_state_text = "Robot actions enabled"
 
 # -----------------------------
 # MAIN LOOP
@@ -242,6 +244,20 @@ while True:
 
             fingers_text = f"Fingers: {fingers} | Hand: {hand_label}"
 
+    # Pause state handling: open palm pauses robot actions until thumb out is seen
+    if pause_active:
+        if gesture_text == "Thumb Out":
+            pause_active = False
+            pause_state_text = "Robot actions resumed"
+            gesture_text = "Thumb Out detected - resuming robot"
+        else:
+            pause_state_text = "Robot actions paused"
+            gesture_text = "Robot paused - show Thumb Out"
+    elif gesture_text == "Open Palm":
+        pause_active = True
+        pause_state_text = "Robot actions paused"
+        gesture_text = "Open Palm detected - robot paused"
+
     # -----------------------------
     # FPS CALCULATION
     # -----------------------------
@@ -266,8 +282,18 @@ while True:
 
     cv2.putText(
         frame,
-        fingers_text,
+        pause_state_text,
         (30, 105),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        fingers_text,
+        (30, 145),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
@@ -277,7 +303,7 @@ while True:
     cv2.putText(
         frame,
         f"FPS: {int(fps)}",
-        (30, 145),
+        (30, 185),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
