@@ -1,180 +1,124 @@
 import cv2
-import mediapipe as mp
 import time
 import math
+import numpy as np
 
 
 # -----------------------------
-# SETUP MEDIAPIPE HAND TRACKING
-# -----------------------------
-
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-
-hands = mp_hands.Hands(
-    static_image_mode=False,        # False = video/live camera mode
-    max_num_hands=1,                # Track one hand for now
-    min_detection_confidence=0.4,   # How confident before detecting hand
-    min_tracking_confidence=0.4     # How confident before tracking hand
-)
-
-
-# -----------------------------
-# FINGER DETECTION FUNCTION
+# SETUP OPENCV HAND TRACKING
+# Hand detection via skin contour analysis (no MediaPipe dependency)
 # -----------------------------
 
 
-def angle_between_points(a, b, c):
-    """
-    Returns the angle at point b formed by points a-b-c.
-    Example: angle at the middle finger joint.
-    """
+# Hand detection via skin mask (HSV + YCrCb)
+def get_skin_mask(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    lower_hsv = np.array([0, 30, 60], dtype=np.uint8)
+    upper_hsv = np.array([25, 150, 255], dtype=np.uint8)
+    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
+    return mask
 
-    ab = [a.x - b.x, a.y - b.y, a.z - b.z]
-    cb = [c.x - b.x, c.y - b.y, c.z - b.z]
 
-    dot_product = ab[0] * cb[0] + ab[1] * cb[1] + ab[2] * cb[2]
+def find_largest_contour(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contours = [c for c in contours if cv2.contourArea(c) > 2000]
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
 
-    ab_length = math.sqrt(ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2)
-    cb_length = math.sqrt(cb[0] ** 2 + cb[1] ** 2 + cb[2] ** 2)
 
-    if ab_length == 0 or cb_length == 0:
+def count_hand_defects(contour):
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 3:
         return 0
+    defects = cv2.convexityDefects(contour, hull)
+    if defects is None:
+        return 0
+    count = 0
+    for i in range(defects.shape[0]):
+        s, e, f, d = defects[i, 0]
+        start = tuple(contour[s][0])
+        end = tuple(contour[e][0])
+        far = tuple(contour[f][0])
+        a = np.linalg.norm(np.array(end) - np.array(start))
+        b = np.linalg.norm(np.array(far) - np.array(start))
+        c = np.linalg.norm(np.array(end) - np.array(far))
+        if b == 0 or c == 0:
+            continue
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (b * b + c * c - a * a) / (2 * b * c)))))
+        if angle < 90 and d > 2500:
+            count += 1
+    return count
 
-    cosine_angle = dot_product / (ab_length * cb_length)
 
-    # Prevent math domain errors
-    cosine_angle = max(-1, min(1, cosine_angle))
+def detect_hand_gesture_cv(frame):
+    """
+    Detect hand gestures using OpenCV contour analysis.
+    Returns: gesture_text, fingers_text, hand_label, contour (or None)
+    """
+    gesture_text = "No hand detected"
+    fingers_text = ""
+    hand_label = ""
+    contour = None
+    
+    mask = get_skin_mask(frame)
+    largest_contour = find_largest_contour(mask)
+    
+    if largest_contour is not None:
+        contour = largest_contour
+        defects = count_hand_defects(largest_contour)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        aspect_ratio = float(w) / float(h) if h > 0 else 0
+        area = cv2.contourArea(largest_contour)
+        
+        if defects >= 4 and area > 7000:
+            gesture_text = "Open Palm"
+        elif defects <= 1 and aspect_ratio > 1.3 and area > 3500:
+            gesture_text = "Thumb Out"
+        else:
+            gesture_text = "Hand detected"
+        
+        fingers_text = f"Defects: {defects} | Area: {int(area)} | Ratio: {aspect_ratio:.2f}"
+        hand_label = "Right"  # Default; OpenCV doesn't distinguish left/right
+    
+    return gesture_text, fingers_text, hand_label, contour
 
-    angle = math.degrees(math.acos(cosine_angle))
-    return angle
+
+# Legacy function names for backward compatibility (kept but simplified)
+def angle_between_points(a, b, c):
+    """Legacy function stub - not used in OpenCV mode."""
+    return 0
 
 
 def distance(a, b):
-    return math.sqrt(
-        (a.x - b.x) ** 2 +
-        (a.y - b.y) ** 2 +
-        (a.z - b.z) ** 2
-    )
+    """Legacy function stub - not used in OpenCV mode."""
+    return 0
 
 
 def count_fingers_up(hand_landmarks, hand_label=None):
-    """
-    More accurate finger detection using joint angles.
-
-    Returns:
-    [thumb, index, middle, ring, pinky]
-    """
-
-    lm = hand_landmarks.landmark
-
-    fingers = []
-
-    # -----------------------------
-    # THUMB
-    # -----------------------------
-    # Thumb is special, so we use thumb angle + distance.
-    thumb_angle = angle_between_points(lm[2], lm[3], lm[4])
-    thumb_tip_to_index_base = distance(lm[4], lm[5])
-    thumb_base_to_index_base = distance(lm[2], lm[5])
-
-    thumb_extended = thumb_angle > 145 and thumb_tip_to_index_base > thumb_base_to_index_base * 0.7
-
-    fingers.append(1 if thumb_extended else 0)
-
-    # -----------------------------
-    # INDEX, MIDDLE, RING, PINKY
-    # -----------------------------
-    # Each finger has:
-    # MCP = base knuckle
-    # PIP = middle joint
-    # DIP = upper joint
-    # TIP = fingertip
-
-    finger_joints = [
-        (5, 6, 7, 8),      # index
-        (9, 10, 11, 12),   # middle
-        (13, 14, 15, 16),  # ring
-        (17, 18, 19, 20)   # pinky
-    ]
-
-    for mcp, pip, dip, tip in finger_joints:
-        # Angle at PIP joint
-        pip_angle = angle_between_points(lm[mcp], lm[pip], lm[dip])
-
-        # Angle at DIP joint
-        dip_angle = angle_between_points(lm[pip], lm[dip], lm[tip])
-
-        # Fingertip should also be farther from wrist than the middle joint
-        tip_dist = distance(lm[0], lm[tip])
-        pip_dist = distance(lm[0], lm[pip])
-
-        # A finger is extended if both joints are fairly straight
-        # and the fingertip is clearly out from the palm.
-        is_extended = (
-            pip_angle > 150 and
-            dip_angle > 150 and
-            tip_dist > pip_dist * 1.05
-        )
-
-        fingers.append(1 if is_extended else 0)
-
-    return fingers
+    """Legacy function stub - not used in OpenCV mode."""
+    return [0, 0, 0, 0, 0]
 
 
 def get_pointing_direction(hand_landmarks):
-    """
-    Detects whether the index finger is pointing left, right, up, or down.
-    Uses index finger base landmark 5 and index fingertip landmark 8.
-    """
-
-    lm = hand_landmarks.landmark
-
-    index_base = lm[5]
-    index_tip = lm[8]
-
-    dx = index_tip.x - index_base.x
-    dy = index_tip.y - index_base.y
-
-    # If horizontal movement is stronger than vertical movement
-    if abs(dx) > abs(dy):
-        if dx < -0.06:
-            return "Pointing Left"
-        elif dx > 0.06:
-            return "Pointing Right"
-
-    # If vertical movement is stronger than horizontal movement
-    else:
-        if dy < -0.06:
-            return "Pointing Up"
-        elif dy > 0.06:
-            return "Pointing Down"
-
+    """Legacy function stub - not used in OpenCV mode."""
     return "Pointing"
 
-# -----------------------------
-# BASIC GESTURE DECODER
-# -----------------------------
 
 def decode_gesture(fingers, hand_landmarks=None):
-    if fingers == [0, 0, 0, 0, 0]:
-        return "Fist"
-
-    if fingers == [1, 1, 1, 1, 1]:
-        return "Open Palm"
-
-    if fingers == [0, 1, 0, 0, 0]:
-        if hand_landmarks is not None:
-            return get_pointing_direction(hand_landmarks)
-        return "Index Pointing"
-
-    if fingers == [0, 1, 1, 0, 0]:
-        return "Peace Sign"
-
-    if fingers == [1, 0, 0, 0, 0]:
-        return "Thumb Out"
-
-    return f"{sum(fingers)} fingers extended: {fingers}"
+    """Legacy function stub - not used in OpenCV mode."""
+    return "Hand detected"
 
 # -----------------------------
 # START CAMERA
@@ -210,39 +154,14 @@ while True:
     # Flip frame horizontally so it feels like a mirror
     frame = cv2.flip(frame, 1)
 
-    # Convert BGR to RGB because MediaPipe uses RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Process the frame and detect hands
-    results = hands.process(rgb_frame)
-
-    # Default values
-    gesture_text = "No hand detected"
-    fingers_text = ""
-
-    # If hand is detected
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for hand_landmarks, handedness in zip(
-            results.multi_hand_landmarks,
-            results.multi_handedness
-        ):
-            # Get whether MediaPipe thinks this is left or right hand
-            hand_label = handedness.classification[0].label
-
-            # Draw hand skeleton
-            mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS
-            )
-
-            # Count fingers
-            fingers = count_fingers_up(hand_landmarks, hand_label)
-
-            # Decode gesture
-            gesture_text = decode_gesture(fingers, hand_landmarks)
-
-            fingers_text = f"Fingers: {fingers} | Hand: {hand_label}"
+    # Detect hand gesture using OpenCV
+    gesture_text, fingers_text, hand_label, contour = detect_hand_gesture_cv(frame)
+    
+    # Draw contour and hull if hand detected
+    if contour is not None:
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
+        cv2.drawContours(frame, [hull], -1, (255, 0, 0), 2)
 
     # Pause state handling: open palm pauses robot actions until thumb out is seen
     if pause_active:
