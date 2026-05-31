@@ -74,110 +74,502 @@ def pixel_to_robot(u, v, H):
 
 
 # -----------------------------
-# HAND GESTURE DETECTION
+# HAND GESTURE DETECTION + EMERGENCY PAUSE/RESUME
+# Uses the same MediaPipe/landmark rules as the standalone hand tracker.
+# Rules:
+#   Peace Sign  -> immediately request robot stop and pause program
+#   Thumb Out   -> resume program after pause
+#
+# Important: this is a software stop, not a certified safety emergency stop.
+# Keep a physical emergency stop available whenever the robot is powered.
 # -----------------------------
 
+import threading
+
+import mediapipe as mp
+
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    model_complexity=1,
+    max_num_hands=1,
+    min_detection_confidence=0.4,
+    min_tracking_confidence=0.4
+)
+
+# Shared state between the robot thread and the hand-monitor thread.
 pause_active = False
-pause_state_text = "Robot actions enabled"
+pause_state_text = ""
+last_raw_gesture = "No hand detected"
+program_running = True
+emergency_stop_issued = False
+
+# If the robot is interrupted during a command, repeat that same command after Thumb Out.
+# This is usually safer than skipping to the next command after an interrupted move.
+RETRY_INTERRUPTED_COMMAND_AFTER_RESUME = True
+
+# Gesture safety filtering. Pause/resume are kept. Thumb Out must be held for several consecutive frames
+# before resume. This prevents a fist, a partial hand, or a hand re-entering the
+# camera view from accidentally resuming the robot.
+PAUSE_REQUIRED_PEACE_FRAMES = 2
+RESUME_REQUIRED_THUMB_FRAMES = 10
+pause_peace_counter = 0
+resume_thumb_counter = 0
+
+# Keep this False by default. Opening the gripper/stopping suction during an emergency
+# could drop the object. Turn it on only if your use case requires release on stop.
+RELEASE_END_EFFECTOR_ON_ESTOP = False
+
+camera_lock = threading.Lock()
+state_lock = threading.Lock()
 
 
-def get_skin_mask(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    lower_hsv = np.array([0, 30, 60], dtype=np.uint8)
-    upper_hsv = np.array([25, 150, 255], dtype=np.uint8)
-    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
-    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
-    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
-    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
-    mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.GaussianBlur(mask, (7, 7), 0)
-    return mask
+def read_camera_frame():
+    """Thread-safe camera read because the main loop and monitor thread both use cap."""
+    with camera_lock:
+        return cap.read()
 
 
-def find_largest_contour(mask):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contours = [c for c in contours if cv2.contourArea(c) > 2000]
-    if not contours:
-        return None
-    return max(contours, key=cv2.contourArea)
+def angle_between_points(a, b, c):
+    ab = [a.x - b.x, a.y - b.y, a.z - b.z]
+    cb = [c.x - b.x, c.y - b.y, c.z - b.z]
 
+    dot_product = ab[0] * cb[0] + ab[1] * cb[1] + ab[2] * cb[2]
 
-def count_hand_defects(contour):
-    hull = cv2.convexHull(contour, returnPoints=False)
-    if hull is None or len(hull) < 3:
+    ab_length = math.sqrt(ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2)
+    cb_length = math.sqrt(cb[0] ** 2 + cb[1] ** 2 + cb[2] ** 2)
+
+    if ab_length == 0 or cb_length == 0:
         return 0
-    defects = cv2.convexityDefects(contour, hull)
-    if defects is None:
-        return 0
-    count = 0
-    for i in range(defects.shape[0]):
-        s, e, f, d = defects[i, 0]
-        start = tuple(contour[s][0])
-        end = tuple(contour[e][0])
-        far = tuple(contour[f][0])
-        a = np.linalg.norm(np.array(end) - np.array(start))
-        b = np.linalg.norm(np.array(far) - np.array(start))
-        c = np.linalg.norm(np.array(end) - np.array(far))
-        if b == 0 or c == 0:
-            continue
-        angle = math.degrees(math.acos(max(-1.0, min(1.0, (b * b + c * c - a * a) / (2 * b * c)))))
-        if angle < 90 and d > 2500:
-            count += 1
-    return count
+
+    cosine_angle = dot_product / (ab_length * cb_length)
+    cosine_angle = max(-1, min(1, cosine_angle))
+    return math.degrees(math.acos(cosine_angle))
+
+
+def landmark_distance(a, b):
+    return math.sqrt(
+        (a.x - b.x) ** 2 +
+        (a.y - b.y) ** 2 +
+        (a.z - b.z) ** 2
+    )
+
+
+def palm_size_from_landmarks(lm):
+    """Approximate hand scale so thresholds work at different camera distances."""
+    # wrist to middle MCP is a stable palm-size reference
+    return max(landmark_distance(lm[0], lm[9]), 1e-6)
+
+
+def finger_is_extended(lm, mcp, pip, dip, tip):
+    """
+    Rotation-tolerant finger extension test for index/middle/ring/pinky.
+    A finger must be fairly straight AND the fingertip must be farther from
+    the wrist than the PIP joint. This avoids counting curled fingers as up.
+    """
+    pip_angle = angle_between_points(lm[mcp], lm[pip], lm[dip])
+    dip_angle = angle_between_points(lm[pip], lm[dip], lm[tip])
+    tip_dist = landmark_distance(lm[0], lm[tip])
+    pip_dist = landmark_distance(lm[0], lm[pip])
+
+    return (
+        pip_angle > 150 and
+        dip_angle > 145 and
+        tip_dist > pip_dist * 1.06
+    )
+
+
+def thumb_is_extended_basic(hand_landmarks, hand_label=None):
+    """
+    General thumb-extension detector for display purposes.
+    This is not enough by itself to resume the robot.
+    """
+    lm = hand_landmarks.landmark
+    psize = palm_size_from_landmarks(lm)
+
+    thumb_angle = angle_between_points(lm[2], lm[3], lm[4])
+    thumb_tip_to_wrist = landmark_distance(lm[4], lm[0])
+    thumb_ip_to_wrist = landmark_distance(lm[3], lm[0])
+    thumb_tip_to_index_mcp = landmark_distance(lm[4], lm[5])
+    thumb_ip_to_index_mcp = landmark_distance(lm[3], lm[5])
+
+    return (
+        thumb_angle > 150 and
+        thumb_tip_to_wrist > thumb_ip_to_wrist * 1.03 and
+        thumb_tip_to_index_mcp > thumb_ip_to_index_mcp * 1.08 and
+        landmark_distance(lm[2], lm[4]) > psize * 0.30
+    )
+
+
+def is_thumb_out_control(hand_landmarks, hand_label=None):
+    """
+    Control-level Thumb Out detector used to RESUME the robot.
+
+    This is stricter than normal thumb detection because a false positive here
+    can resume the arm. It requires:
+      - thumb is straight and separated from the palm/index side
+      - thumb points mostly sideways
+      - index/middle/ring/pinky are folded
+
+    So a fist, a partial hand entering the frame, or a curled hand should not
+    resume the robot.
+    """
+    lm = hand_landmarks.landmark
+    psize = palm_size_from_landmarks(lm)
+
+    # Other fingers must be folded for a resume command.
+    index_up = finger_is_extended(lm, 5, 6, 7, 8)
+    middle_up = finger_is_extended(lm, 9, 10, 11, 12)
+    ring_up = finger_is_extended(lm, 13, 14, 15, 16)
+    pinky_up = finger_is_extended(lm, 17, 18, 19, 20)
+    if index_up or middle_up or ring_up or pinky_up:
+        return False
+
+    # Thumb geometry.
+    thumb_angle = angle_between_points(lm[2], lm[3], lm[4])
+    thumb_len = landmark_distance(lm[2], lm[4])
+    thumb_tip_to_index_mcp = landmark_distance(lm[4], lm[5])
+    thumb_ip_to_index_mcp = landmark_distance(lm[3], lm[5])
+    thumb_tip_to_palm = landmark_distance(lm[4], lm[9])
+    thumb_ip_to_palm = landmark_distance(lm[3], lm[9])
+
+    # Direction of thumb from thumb MCP/base toward thumb tip.
+    dx = lm[4].x - lm[2].x
+    dy = lm[4].y - lm[2].y
+
+    thumb_straight = thumb_angle > 152
+    thumb_long_enough = thumb_len > psize * 0.33
+    thumb_separated = (
+        thumb_tip_to_index_mcp > thumb_ip_to_index_mcp * 1.10 and
+        thumb_tip_to_palm > thumb_ip_to_palm * 1.06
+    )
+    thumb_sideways = abs(dx) > abs(dy) * 1.10 and abs(dx) > psize * 0.25
+
+    return thumb_straight and thumb_long_enough and thumb_separated and thumb_sideways
+
+
+def count_fingers_up(hand_landmarks, hand_label=None):
+    """
+    Refined landmark-based finger detection.
+    Returns [thumb, index, middle, ring, pinky].
+    The thumb value is for display/diagnostics; robot resume uses
+    is_thumb_out_control(), which is stricter and state-gated.
+    """
+    lm = hand_landmarks.landmark
+
+    thumb = 1 if thumb_is_extended_basic(hand_landmarks, hand_label) else 0
+    index = 1 if finger_is_extended(lm, 5, 6, 7, 8) else 0
+    middle = 1 if finger_is_extended(lm, 9, 10, 11, 12) else 0
+    ring = 1 if finger_is_extended(lm, 13, 14, 15, 16) else 0
+    pinky = 1 if finger_is_extended(lm, 17, 18, 19, 20) else 0
+
+    return [thumb, index, middle, ring, pinky]
+
+
+def get_pointing_direction(hand_landmarks):
+    lm = hand_landmarks.landmark
+    index_base = lm[5]
+    index_tip = lm[8]
+
+    dx = index_tip.x - index_base.x
+    dy = index_tip.y - index_base.y
+
+    if abs(dx) > abs(dy):
+        if dx < -0.06:
+            return "Pointing Left"
+        if dx > 0.06:
+            return "Pointing Right"
+    else:
+        if dy < -0.06:
+            return "Pointing Up"
+        if dy > 0.06:
+            return "Pointing Down"
+
+    return "Pointing"
+
+
+def decode_gesture(fingers, hand_landmarks=None):
+    """
+    Human-readable gesture label.
+    IMPORTANT: robot pause/resume does not rely only on this text. It uses
+    decode_control_gesture() so accidental display labels cannot resume motion.
+    """
+    if fingers == [0, 0, 0, 0, 0]:
+        return "Fist"
+    if fingers == [1, 1, 1, 1, 1]:
+        return "Open Palm"
+    if fingers == [0, 1, 0, 0, 0]:
+        if hand_landmarks is not None:
+            return get_pointing_direction(hand_landmarks)
+        return "Index Finger"
+    if fingers == [0, 0, 1, 0, 0]:
+        return "Middle Finger"
+    if fingers == [0, 0, 0, 1, 0]:
+        return "Ring Finger"
+    if fingers == [0, 0, 0, 0, 1]:
+        return "Pinky Finger"
+    if fingers in ([0, 1, 1, 0, 0], [1, 1, 1, 0, 0]):
+        return "Peace Sign"
+    if hand_landmarks is not None and is_thumb_out_control(hand_landmarks):
+        return "Thumb Out"
+    return f"{sum(fingers)} fingers extended: {fingers}"
+
+
+def decode_control_gesture(hand_landmarks, hand_label=None):
+    """
+    Safety/control gesture decoder for robot pause/resume.
+    Returns only command-level labels:
+      Peace Sign, Thumb Out, or a non-command display gesture.
+    """
+    if hand_landmarks is None:
+        return "No hand detected", [0, 0, 0, 0, 0]
+
+    fingers = count_fingers_up(hand_landmarks, hand_label)
+
+    # Pause command: index + middle extended, ring + pinky folded.
+    # Thumb may be folded or slightly visible, so allow thumb 0 or 1.
+    if fingers[1] == 1 and fingers[2] == 1 and fingers[3] == 0 and fingers[4] == 0:
+        return "Peace Sign", fingers
+
+    # Resume command: stricter geometry and other fingers folded.
+    if is_thumb_out_control(hand_landmarks, hand_label):
+        return "Thumb Out", fingers
+
+    return decode_gesture(fingers, hand_landmarks), fingers
+
+
+def draw_top_text(frame, text, y_offset=40, font_scale=1.2, thickness=3, color=(0, 255, 255)):
+    cv2.putText(frame, text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+
+
+def detect_raw_hand_gesture(frame, display_frame=None, draw=True):
+    """
+    Detect gesture from the full camera frame. No action-area ROI is used.
+    If draw=True, landmarks and finger states are drawn onto display_frame.
+    """
+    if display_frame is None:
+        display_frame = frame
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+
+    if not results.multi_hand_landmarks or not results.multi_handedness:
+        return "No hand detected"
+
+    raw_gesture = "No hand detected"
+
+    for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+        hand_label = handedness.classification[0].label
+        raw_gesture, fingers = decode_control_gesture(hand_landmarks, hand_label)
+
+        if draw:
+            mp_draw.draw_landmarks(
+                display_frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS,
+                mp_draw.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=3),
+                mp_draw.DrawingSpec(color=(0, 0, 255), thickness=2),
+            )
+            cv2.putText(
+                display_frame,
+                f"Gesture: {raw_gesture} | Fingers: {fingers} | Hand: {hand_label}",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+    return raw_gesture
+
+
+def _call_dobot_if_available(function_name):
+    """Best-effort call into DobotDllType. Different Dobot libraries expose different names."""
+    fn = getattr(dType, function_name, None)
+    if callable(fn):
+        try:
+            fn(api)
+            print(f"[DOBOT] Called {function_name}()")
+            return True
+        except Exception as exc:
+            print(f"[DOBOT] {function_name}() failed: {exc}")
+    return False
+
+
+def robot_emergency_stop():
+    """
+    Best-effort immediate software stop.
+    This is intended to interrupt queued Dobot motion while the main thread may be inside move_to_xyz().
+    """
+    print("[EMERGENCY] Peace Sign detected. Requesting robot stop NOW.")
+
+    # Common Dobot queue-stop functions. These are best-effort because exact wrappers vary.
+    stopped = False
+    for name in [
+        "SetQueuedCmdForceStopExec",
+        "SetQueuedCmdStopExec",
+        "SetPTPStop",
+    ]:
+        stopped = _call_dobot_if_available(name) or stopped
+
+    # Clear queued future commands if supported.
+    for name in ["SetQueuedCmdClear"]:
+        _call_dobot_if_available(name)
+
+    if RELEASE_END_EFFECTOR_ON_ESTOP:
+        try:
+            dobotArm.stop_pump(api)
+            dobotArm.open_gripper(api)
+            print("[EMERGENCY] End effector released because RELEASE_END_EFFECTOR_ON_ESTOP=True")
+        except Exception as exc:
+            print(f"[EMERGENCY] End effector release failed: {exc}")
+
+    if not stopped:
+        print("[WARNING] No Dobot force-stop function was available. Use the physical emergency stop if motion continues.")
+
+
+def robot_resume_after_stop():
+    """Best-effort resume of the Dobot command queue after Thumb Out."""
+    print("[RESUME] Thumb Out detected. Resuming program.")
+    for name in ["SetQueuedCmdStartExec"]:
+        _call_dobot_if_available(name)
+
+
+def update_pause_state_from_gesture(raw_gesture):
+    global pause_active, pause_state_text, last_raw_gesture, emergency_stop_issued
+    global pause_peace_counter, resume_thumb_counter
+
+    last_raw_gesture = raw_gesture
+
+    with state_lock:
+        if pause_active:
+            # While paused, ONLY a stable strict Thumb Out resumes the robot.
+            # No hand, fist, open palm, and re-entering the frame all reset the counter.
+            pause_peace_counter = 0
+
+            if raw_gesture == "Thumb Out":
+                resume_thumb_counter += 1
+                if resume_thumb_counter >= RESUME_REQUIRED_THUMB_FRAMES:
+                    pause_active = False
+                    pause_state_text = ""
+                    emergency_stop_issued = False
+                    resume_thumb_counter = 0
+                    robot_resume_after_stop()
+                    return "Thumb Out held - robot resumed"
+
+                pause_state_text = (
+                    f"ROBOT PAUSED - hold Thumb Out "
+                    f"({resume_thumb_counter}/{RESUME_REQUIRED_THUMB_FRAMES})"
+                )
+                return pause_state_text
+
+            resume_thumb_counter = 0
+            pause_state_text = "ROBOT PAUSED - show a clear Thumb Out to resume"
+            return pause_state_text
+
+        # Not paused: only a stable Peace Sign pauses/stops the robot.
+        resume_thumb_counter = 0
+
+        if raw_gesture == "Peace Sign":
+            pause_peace_counter += 1
+            if pause_peace_counter >= PAUSE_REQUIRED_PEACE_FRAMES:
+                pause_active = True
+                pause_state_text = "ROBOT PAUSED - show a clear Thumb Out to resume"
+                pause_peace_counter = 0
+                if not emergency_stop_issued:
+                    emergency_stop_issued = True
+                    robot_emergency_stop()
+                return pause_state_text
+
+            return f"Peace Sign detected ({pause_peace_counter}/{PAUSE_REQUIRED_PEACE_FRAMES})"
+
+        pause_peace_counter = 0
+        pause_state_text = ""
+        return raw_gesture
 
 
 def detect_hand_gesture(frame):
-    global pause_active, pause_state_text
-    gesture_text = "No hand detected"
-    mask = get_skin_mask(frame)
-    contour = find_largest_contour(mask)
-    if contour is not None:
-        defects = count_hand_defects(contour)
-        x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = float(w) / float(h) if h > 0 else 0
-        area = cv2.contourArea(contour)
-        if defects >= 4 and area > 7000:
-            gesture_text = "Open Palm"
-        elif defects <= 1 and aspect_ratio > 1.3 and area > 3500:
-            gesture_text = "Thumb Out"
-        else:
-            gesture_text = "Hand detected"
-        hull = cv2.convexHull(contour)
-        cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
-        cv2.drawContours(frame, [hull], -1, (255, 0, 0), 2)
+    """Detect gesture on full frame and update pause/resume state."""
+    raw_gesture = detect_raw_hand_gesture(frame, frame, draw=True)
+    return update_pause_state_from_gesture(raw_gesture)
+
+
+def hand_monitor_loop():
+    """
+    Background hand monitor.
+    It checks the full camera frame continuously. Debouncing is handled in
+    update_pause_state_from_gesture(), so a single false Thumb Out frame cannot resume.
+    """
+    global program_running
+
+    while program_running:
+        ret, frame = read_camera_frame()
+        if not ret:
+            time.sleep(0.02)
+            continue
+
+        try:
+            frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        except Exception:
+            pass
+
+        raw = detect_raw_hand_gesture(frame, draw=False)
+        update_pause_state_from_gesture(raw)
+
+        time.sleep(0.01)
+
+
+def show_hand_status_frame(frame, gesture_text):
     if pause_active:
-        if gesture_text == "Thumb Out":
-            pause_active = False
-            pause_state_text = "Robot actions resumed"
-            gesture_text = "Thumb Out detected - resuming"
-        else:
-            pause_state_text = "Robot actions paused"
-            gesture_text = "Robot paused - show Thumb Out"
-    elif gesture_text == "Open Palm":
-        pause_active = True
-        pause_state_text = "Robot actions paused"
-        gesture_text = "Open Palm detected - robot paused"
-    return gesture_text
+        draw_top_text(frame, "ROBOT PAUSED", y_offset=40, color=(0, 0, 255))
+        draw_top_text(frame, "Show Thumb Out to resume", y_offset=85, font_scale=0.8, thickness=2, color=(0, 255, 255))
+    else:
+        draw_top_text(frame, gesture_text, y_offset=40, font_scale=1.0, thickness=2, color=(0, 255, 0))
+
+    cv2.imshow("Detection", frame)
+    cv2.waitKey(1)
 
 
 def wait_for_resume():
+    """Block the main program while paused. Only Thumb Out resumes."""
     while pause_active:
-        success, frame = cap.read()
-        if not success:
+        ret, frame = read_camera_frame()
+        if not ret:
+            time.sleep(0.02)
             continue
+
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-        gesture_text = detect_hand_gesture(frame)
-        cv2.putText(frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow("Detection", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        display_frame = frame.copy()
+        gesture_text = detect_hand_gesture(display_frame)
+        show_hand_status_frame(display_frame, gesture_text)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+
+
+def guarded_robot_call(action_name, func, *args, **kwargs):
+    """
+    Run a robot action under the gesture emergency gate.
+    If Peace Sign happens during this blocking call, the monitor thread requests a stop.
+    After Thumb Out, this wrapper repeats the interrupted command by default.
+    """
+    while True:
+        wait_for_resume()
+
+        print(f"[ROBOT] Starting: {action_name}")
+        result = func(*args, **kwargs)
+
+        if pause_active:
+            print(f"[ROBOT] {action_name} was interrupted. Waiting for Thumb Out...")
+            wait_for_resume()
+            if RETRY_INTERRUPTED_COMMAND_AFTER_RESUME:
+                print(f"[ROBOT] Retrying interrupted command: {action_name}")
+                continue
+
+        return result
+
 
 
 # State machine logic to control the flow of the program through the three phases: scanning for plates, scanning for targets, and executing pick/place operations.
@@ -208,7 +600,7 @@ def phase_detect_plates():
     last_count = 0
     
     while True:
-        ret, frame = cap.read()
+        ret, frame = read_camera_frame()
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         display_frame = frame.copy()
         
@@ -232,8 +624,10 @@ def phase_detect_plates():
             last_count = len(current_list)
 
         gesture_text = detect_hand_gesture(display_frame)
-        cv2.putText(display_frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(display_frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if pause_active:
+            stability_counter = 0
+            show_hand_status_frame(display_frame, gesture_text)
+            continue
 
         progress = int((stability_counter / STABILITY_LIMIT) * 100)
         cv2.putText(display_frame, f"LOCKING PLATES: {progress}%", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -257,7 +651,7 @@ def phase_detect_targets():
     last_count = 0
     
     while True:
-        ret, frame = cap.read()
+        ret, frame = read_camera_frame()
         if not ret: continue
         
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
@@ -291,8 +685,10 @@ def phase_detect_targets():
                 last_count = len(current_list)
 
         gesture_text = detect_hand_gesture(display_frame)
-        cv2.putText(display_frame, pause_state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(display_frame, gesture_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if pause_active:
+            stability_counter = 0
+            show_hand_status_frame(display_frame, gesture_text)
+            continue
 
         progress = int((stability_counter / STABILITY_LIMIT) * 100)
         color = (0, 255, 0) if progress < 100 else (255, 255, 0)
@@ -334,23 +730,23 @@ def phase_execute_batch(api, pick_list, drop_list):
 
         # --- PICK SEQUENCE ---
         wait_for_resume()
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
+        guarded_robot_call("move above target", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_SAFE)
         wait_for_resume()
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
+        guarded_robot_call("move down to pick", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_PICK)
         wait_for_resume()
-        dobotArm.close_gripper(api)
+        guarded_robot_call("close gripper", dobotArm.close_gripper, api)
         wait_for_resume()
-        dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
+        guarded_robot_call("move above target", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_SAFE)
 
         # --- PLACE SEQUENCE ---
         wait_for_resume()
-        dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+        guarded_robot_call("move above drop zone", dobotArm.move_to_xyz, api, drop_x, drop_y, Z_SAFE)
         wait_for_resume()
-        dobotArm.open_gripper(api)
+        guarded_robot_call("open gripper", dobotArm.open_gripper, api)
         wait_for_resume()
-        dobotArm.stop_pump(api)
+        guarded_robot_call("stop pump", dobotArm.stop_pump, api)
         wait_for_resume()
-        dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+        guarded_robot_call("move above drop zone", dobotArm.move_to_xyz, api, drop_x, drop_y, Z_SAFE)
 
     # irl, it is ok for 1 dish to contain multiple parts
     # if len(pick_list) > len(drop_list):
@@ -358,20 +754,24 @@ def phase_execute_batch(api, pick_list, drop_list):
     #         pick_x, pick_y = pick_list[i]
     #         drop_x, drop_y = drop_list[0]
     #         # --- PICK SEQUENCE ---
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
-    #         dobotArm.close_gripper(api)
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
+    #         guarded_robot_call("move above target", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_SAFE)
+    #         guarded_robot_call("move down to pick", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_PICK)
+    #         guarded_robot_call("close gripper", dobotArm.close_gripper, api)
+    #         guarded_robot_call("move above target", dobotArm.move_to_xyz, api, pick_x, pick_y, Z_SAFE)
 
     #     # --- PLACE SEQUENCE ---
-    #         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
-    #         dobotArm.open_gripper(api)
-    #         dobotArm.stop_pump(api)
-    #         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+    #         guarded_robot_call("move above drop zone", dobotArm.move_to_xyz, api, drop_x, drop_y, Z_SAFE)
+    #         guarded_robot_call("open gripper", dobotArm.open_gripper, api)
+    #         guarded_robot_call("stop pump", dobotArm.stop_pump, api)
+    #         guarded_robot_call("move above drop zone", dobotArm.move_to_xyz, api, drop_x, drop_y, Z_SAFE)
 
     print("\nBatch Complete.")
     return True
  
+
+# Start background hand monitor before robot begins moving.
+hand_monitor_thread = threading.Thread(target=hand_monitor_loop, daemon=True)
+hand_monitor_thread.start()
 
 # ---------------------------------------------------------
 # MAIN EXECUTION
