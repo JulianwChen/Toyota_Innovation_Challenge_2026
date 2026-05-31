@@ -19,7 +19,16 @@
 
 import os
 import sys
+
+try:
+    import pygame
+    AUDIO_AVAILABLE = True
+except ImportError:
+    pygame = None
+    AUDIO_AVAILABLE = False
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
 for candidate_dir in [script_dir, os.path.dirname(script_dir)]:
     lib_dir = os.path.join(candidate_dir, "lib")
     if os.path.isdir(lib_dir) and candidate_dir not in sys.path:
@@ -72,6 +81,42 @@ def pixel_to_robot(u, v, H):
     xy /= xy[2]
     return xy[0], xy[1]
 
+#
+# Beep when robot action is resumed
+#
+
+RESUME_SOUND_PATH = os.path.join(script_dir, "resume_sound.mp3")
+
+audio_ready = False
+
+def setup_audio():
+    global audio_ready
+
+    if not AUDIO_AVAILABLE:
+        print("[AUDIO] pygame is not installed. Run: python -m pip install pygame")
+        return
+
+    if not os.path.exists(RESUME_SOUND_PATH):
+        print(f"[AUDIO] Resume sound not found: {RESUME_SOUND_PATH}")
+        return
+
+    try:
+        pygame.mixer.init()
+        audio_ready = True
+        print("[AUDIO] Resume sound ready.")
+    except Exception as exc:
+        print(f"[AUDIO] Could not initialize audio: {exc}")
+
+
+def play_resume_sound():
+    if not audio_ready:
+        return
+
+    try:
+        sound = pygame.mixer.Sound(RESUME_SOUND_PATH)
+        sound.play()
+    except Exception as exc:
+        print(f"[AUDIO] Could not play resume sound: {exc}")
 
 # -----------------------------
 # HAND GESTURE DETECTION + EMERGENCY PAUSE/RESUME
@@ -115,8 +160,11 @@ RETRY_INTERRUPTED_COMMAND_AFTER_RESUME = True
 # camera view from accidentally resuming the robot.
 PAUSE_REQUIRED_PEACE_FRAMES = 2
 RESUME_REQUIRED_THUMB_FRAMES = 10
+RESUME_DELAY_SECONDS = 3.0
+
 pause_peace_counter = 0
 resume_thumb_counter = 0
+resume_delay_started_at = None
 
 # Keep this False by default. Opening the gripper/stopping suction during an emergency
 # could drop the object. Turn it on only if your use case requires release on stop.
@@ -433,13 +481,16 @@ def robot_emergency_stop():
 def robot_resume_after_stop():
     """Best-effort resume of the Dobot command queue after Thumb Out."""
     print("[RESUME] Thumb Out detected. Resuming program.")
+
+    play_resume_sound()
+
     for name in ["SetQueuedCmdStartExec"]:
         _call_dobot_if_available(name)
 
 
 def update_pause_state_from_gesture(raw_gesture):
     global pause_active, pause_state_text, last_raw_gesture, emergency_stop_issued
-    global pause_peace_counter, resume_thumb_counter
+    global pause_peace_counter, resume_thumb_counter, resume_delay_started_at
 
     last_raw_gesture = raw_gesture
 
@@ -451,24 +502,40 @@ def update_pause_state_from_gesture(raw_gesture):
 
             if raw_gesture == "Thumb Out":
                 resume_thumb_counter += 1
-                if resume_thumb_counter >= RESUME_REQUIRED_THUMB_FRAMES:
+
+                # Step 1: wait until Thumb Out is stable for enough frames
+                if resume_thumb_counter < RESUME_REQUIRED_THUMB_FRAMES:
+                    resume_delay_started_at = None
+                    pause_state_text = (
+                        f"ROBOT PAUSED - hold Thumb Out "
+                        f"({resume_thumb_counter}/{RESUME_REQUIRED_THUMB_FRAMES})"
+                    )
+                    return pause_state_text
+
+                # Step 2: once Thumb Out is confirmed, start the 3-second delay
+                if resume_delay_started_at is None:
+                    resume_delay_started_at = time.time()
+
+                elapsed = time.time() - resume_delay_started_at
+                remaining = max(0.0, RESUME_DELAY_SECONDS - elapsed)
+
+                if remaining <= 0:
                     pause_active = False
                     pause_state_text = ""
                     emergency_stop_issued = False
                     resume_thumb_counter = 0
+                    resume_delay_started_at = None
                     robot_resume_after_stop()
-                    return "Thumb Out held - robot resumed"
+                    return "Thumb Out confirmed - robot resumed"
 
-                pause_state_text = (
-                    f"ROBOT PAUSED - hold Thumb Out "
-                    f"({resume_thumb_counter}/{RESUME_REQUIRED_THUMB_FRAMES})"
-                )
+                pause_state_text = f"THUMB OUT CONFIRMED - resuming in {remaining:.1f}s"
                 return pause_state_text
 
+            # If anything other than Thumb Out is seen, reset resume progress
             resume_thumb_counter = 0
+            resume_delay_started_at = None
             pause_state_text = "ROBOT PAUSED - show a clear Thumb Out to resume"
             return pause_state_text
-
         # Not paused: only a stable Peace Sign pauses/stops the robot.
         resume_thumb_counter = 0
 
@@ -768,6 +835,8 @@ def phase_execute_batch(api, pick_list, drop_list):
     print("\nBatch Complete.")
     return True
  
+
+setup_audio()
 
 # Start background hand monitor before robot begins moving.
 hand_monitor_thread = threading.Thread(target=hand_monitor_loop, daemon=True)
