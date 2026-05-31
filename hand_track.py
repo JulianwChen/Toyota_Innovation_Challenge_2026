@@ -1,7 +1,11 @@
 import cv2
+<<<<<<< HEAD
 import numpy as np
+=======
+>>>>>>> a6356bf7ecba3982c5fa85f90dac4eddd5af47a2
 import time
 import math
+import numpy as np
 
 USE_MEDIAPIPE = False
 mp = None
@@ -39,6 +43,7 @@ if not USE_MEDIAPIPE:
 
 
 # -----------------------------
+<<<<<<< HEAD
 # SETUP MEDIAPIPE HAND TRACKING
 # -----------------------------
 
@@ -52,39 +57,77 @@ hands = mp_hands.Hands(
 
 # -----------------------------
 # FINGER DETECTION FUNCTION
+=======
+# SETUP OPENCV HAND TRACKING
+# Hand detection via skin contour analysis (no MediaPipe dependency)
+>>>>>>> a6356bf7ecba3982c5fa85f90dac4eddd5af47a2
 # -----------------------------
 
 
-def angle_between_points(a, b, c):
-    """
-    Returns the angle at point b formed by points a-b-c.
-    Example: angle at the middle finger joint.
-    """
+# Hand detection via skin mask (HSV + YCrCb)
+def get_skin_mask(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    lower_hsv = np.array([0, 30, 60], dtype=np.uint8)
+    upper_hsv = np.array([25, 150, 255], dtype=np.uint8)
+    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
+    return mask
 
-    ab = [a.x - b.x, a.y - b.y, a.z - b.z]
-    cb = [c.x - b.x, c.y - b.y, c.z - b.z]
 
-    dot_product = ab[0] * cb[0] + ab[1] * cb[1] + ab[2] * cb[2]
+def find_largest_contour(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contours = [c for c in contours if cv2.contourArea(c) > 2000]
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
 
-    ab_length = math.sqrt(ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2)
-    cb_length = math.sqrt(cb[0] ** 2 + cb[1] ** 2 + cb[2] ** 2)
 
-    if ab_length == 0 or cb_length == 0:
+def count_hand_defects(contour):
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 3:
         return 0
+    defects = cv2.convexityDefects(contour, hull)
+    if defects is None:
+        return 0
+    count = 0
+    for i in range(defects.shape[0]):
+        s, e, f, d = defects[i, 0]
+        start = tuple(contour[s][0])
+        end = tuple(contour[e][0])
+        far = tuple(contour[f][0])
+        a = np.linalg.norm(np.array(end) - np.array(start))
+        b = np.linalg.norm(np.array(far) - np.array(start))
+        c = np.linalg.norm(np.array(end) - np.array(far))
+        if b == 0 or c == 0:
+            continue
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, (b * b + c * c - a * a) / (2 * b * c)))))
+        if angle < 90 and d > 2500:
+            count += 1
+    return count
 
     cosine_angle = dot_product / (ab_length * cb_length)
     cosine_angle = max(-1, min(1, cosine_angle))
 
-    angle = math.degrees(math.acos(cosine_angle))
-    return angle
+
+# Legacy function names for backward compatibility (kept but simplified)
+def angle_between_points(a, b, c):
+    """Legacy function stub - not used in OpenCV mode."""
+    return 0
 
 
 def distance(a, b):
-    return math.sqrt(
-        (a.x - b.x) ** 2 +
-        (a.y - b.y) ** 2 +
-        (a.z - b.z) ** 2
-    )
+    """Legacy function stub - not used in OpenCV mode."""
+    return 0
 
 
 def palm_size_from_landmarks(lm):
@@ -167,6 +210,7 @@ def is_thumb_out_control(hand_landmarks, hand_label=None):
 
 
 def count_fingers_up(hand_landmarks, hand_label=None):
+<<<<<<< HEAD
     """
     Refined landmark-based finger detection.
     Returns [thumb, index, middle, ring, pinky].
@@ -332,6 +376,20 @@ def detect_hand_gesture_cv(frame):
 
     return gesture_text, fingers_text, hand_label, contour
 
+=======
+    """Legacy function stub - not used in OpenCV mode."""
+    return [0, 0, 0, 0, 0]
+
+
+def get_pointing_direction(hand_landmarks):
+    """Legacy function stub - not used in OpenCV mode."""
+    return "Pointing"
+
+
+def decode_gesture(fingers, hand_landmarks=None):
+    """Legacy function stub - not used in OpenCV mode."""
+    return "Hand detected"
+>>>>>>> a6356bf7ecba3982c5fa85f90dac4eddd5af47a2
 
 # -----------------------------
 # START CAMERA
@@ -413,6 +471,7 @@ while True:
 
     frame = cv2.flip(frame, 1)
 
+<<<<<<< HEAD
     gesture_text = "No hand detected"
     fingers_text = ""
 
@@ -440,6 +499,18 @@ while True:
             cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
             cv2.drawContours(frame, [hull], -1, (255, 0, 0), 2)
 
+=======
+    # Detect hand gesture using OpenCV
+    gesture_text, fingers_text, hand_label, contour = detect_hand_gesture_cv(frame)
+    
+    # Draw contour and hull if hand detected
+    if contour is not None:
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
+        cv2.drawContours(frame, [hull], -1, (255, 0, 0), 2)
+
+    # Pause state handling: open palm pauses robot actions until thumb out is seen
+>>>>>>> a6356bf7ecba3982c5fa85f90dac4eddd5af47a2
     if pause_active:
         if gesture_text == "Thumb Out":
             pause_active = False
