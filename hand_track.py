@@ -337,7 +337,8 @@ def detect_hand_gesture_cv(frame):
 # START CAMERA
 # -----------------------------
 
-cap = cv2.VideoCapture(0)
+# change below number to index through different cameras if you have multiple (0, 1, etc.)
+cap = cv2.VideoCapture(1)
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)

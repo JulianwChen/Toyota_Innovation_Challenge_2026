@@ -165,6 +165,7 @@ RESUME_DELAY_SECONDS = 3.0
 pause_peace_counter = 0
 resume_thumb_counter = 0
 resume_delay_started_at = None
+resume_sound_played_for_delay = False
 
 # Keep this False by default. Opening the gripper/stopping suction during an emergency
 # could drop the object. Turn it on only if your use case requires release on stop.
@@ -482,8 +483,6 @@ def robot_resume_after_stop():
     """Best-effort resume of the Dobot command queue after Thumb Out."""
     print("[RESUME] Thumb Out detected. Resuming program.")
 
-    play_resume_sound()
-
     for name in ["SetQueuedCmdStartExec"]:
         _call_dobot_if_available(name)
 
@@ -491,6 +490,7 @@ def robot_resume_after_stop():
 def update_pause_state_from_gesture(raw_gesture):
     global pause_active, pause_state_text, last_raw_gesture, emergency_stop_issued
     global pause_peace_counter, resume_thumb_counter, resume_delay_started_at
+    global resume_sound_played_for_delay
 
     last_raw_gesture = raw_gesture
 
@@ -516,6 +516,11 @@ def update_pause_state_from_gesture(raw_gesture):
                 if resume_delay_started_at is None:
                     resume_delay_started_at = time.time()
 
+                    # Play the warning sound at the START of the 3-second delay
+                    if not resume_sound_played_for_delay:
+                        play_resume_sound()
+                        resume_sound_played_for_delay = True
+
                 elapsed = time.time() - resume_delay_started_at
                 remaining = max(0.0, RESUME_DELAY_SECONDS - elapsed)
 
@@ -525,6 +530,7 @@ def update_pause_state_from_gesture(raw_gesture):
                     emergency_stop_issued = False
                     resume_thumb_counter = 0
                     resume_delay_started_at = None
+                    resume_sound_played_for_delay = False
                     robot_resume_after_stop()
                     return "Thumb Out confirmed - robot resumed"
 
@@ -534,6 +540,7 @@ def update_pause_state_from_gesture(raw_gesture):
             # If anything other than Thumb Out is seen, reset resume progress
             resume_thumb_counter = 0
             resume_delay_started_at = None
+            resume_sound_played_for_delay = False
             pause_state_text = "ROBOT PAUSED - show a clear Thumb Out to resume"
             return pause_state_text
         # Not paused: only a stable Peace Sign pauses/stops the robot.
@@ -640,9 +647,6 @@ def guarded_robot_call(action_name, func, *args, **kwargs):
 
 
 # State machine logic to control the flow of the program through the three phases: scanning for plates, scanning for targets, and executing pick/place operations.
-# THIS STATE MACHINE IS TOO SIMPLE. Can you think of logics that should change the robot's sequnece of actions?
-# Ex: what if the robot fails to pick up a target? should it retry? should it go back to scanning for targets in case the target was moved? what if a new plate is added during the pick/place phase?
-# What if a human's hand is in sight during pick/place phase? (safety first!)
 
 def next_state():
     global machine_state
@@ -659,7 +663,8 @@ def next_state():
 
 # ---------------------------------------------------------
 # PHASE 1: DETECT Part Drop Zones (Plates)
-# this script assumes a metallic circular plate as the drop zone, but you can modify the detection logic to fit your specific use case.
+# this script assumes a metallic circular plate as the drop zone, 
+# but you can modify the detection logic to fit your specific use case.
 # ---------------------------------------------------------
 def phase_detect_plates():
     print("\n[PHASE 1] Scanning for drop zones. Waiting for stability...")
@@ -710,7 +715,8 @@ def phase_detect_plates():
 # ---------------------------------------------------------
 # PHASE 2: DETECT Red velcros to pick up (Red Blocks)
 # this script assumes the targets to be picked up are red blocks
-# be aware your target maynot be red, and they may not be rectangular! You will need to modify the detection logic to fit your specific use case.
+# be aware your target maynot be red, and they may not be rectangular!
+# You will need to modify the detection logic to fit your specific use case.
 # ---------------------------------------------------------
 def phase_detect_targets():
     print("\n[PHASE 2] Scanning for targets. Waiting for stability...")
@@ -776,8 +782,6 @@ def phase_detect_targets():
 # ---------------------------------------------------------
 # PHASE 3: PICK/PLACE LOOP
 # This function assumes 1 drop zone only has 1 part, and executes the pick/place operations in batches.
-# if you are picking up rigid car parts, would you still be able to move directly to the object and to the drop zone? 
-# Do you need collision avoidance? Think about if the robot gripper accidentally hits the plate or other parts on the way to the target, what would happen? How would you modify the robot's movement logic to avoid collisions?
 # ---------------------------------------------------------
 def phase_execute_batch(api, pick_list, drop_list):
     if len(pick_list) == 0 or len(drop_list) == 0:
@@ -844,7 +848,8 @@ hand_monitor_thread.start()
 
 # ---------------------------------------------------------
 # MAIN EXECUTION
-# contains an oversimplified state machine that runs the three phases sequentially. You can modify the logic to fit your specific use case.
+# contains an oversimplified state machine that runs the three phases sequentially.
+# You can modify the logic to fit your specific use case.
 # ---------------------------------------------------------
 dobotArm.initialize_robot(api)
 dobotArm.open_gripper(api)
