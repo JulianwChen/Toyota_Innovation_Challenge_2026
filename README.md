@@ -1,5 +1,7 @@
-**Toyota Innovation Challenge
-Hosted by the Engineering Ideas Clinic and Toyota Motor Manufacturing Canada(TMMC), Toyota engineers introduced real problems they faced in manufacturing environments to students to solve. Universrity of Waterloo Students Julian Chen, Presley Prince, Chakib Belghait, Baran Mangoli and Ralph Kalunga worked together to create a collaborative robotic system to enhance workplace safety around autonomous robots.
+## Toyota Innovation Challenge
+Hosted by the University of Waterloo Engineering Ideas Clinic and Toyota Motor Manufacturing Canada(TMMC).
+Toyota engineers introduced real problems they faced in manufacturing environments to students to solve.
+Group: Julian Chen, Presley Prince, Chakib Belghait, Baran Mangoli and Ralph Kalunga
 
 
 # Collaborative Robotic Arm 
@@ -15,39 +17,6 @@ You are tasked with designing the control of a desktop robotic arm that resemble
 - **Friendly Robots**: how should the robot behave to feel like a companion to workers instead of replacement
 - **More areas to discover**: what do you think the current robotic arm should accomplish to collaborate human worke
 
-## Recommend Roadmap: 
-
-The following directions can be a starting direction for your development. You are not just limited to these directives; feel free to create something that has not been mentioned in the following.
-
-**Milestones:**
-1. Make velcros visible to to robot
-Suggested Development: Modify pickCVBlock.py parameters such that the camera can see the red velcros on the table
-hints: 
-- check out `phase_detect_targets()` function. Don't be afraid to use AI tools to explain the function!
-- velcros are smaller in camera fov in the challenge setup we provide
-- lighting can affect how red the valcros appear to the camera
-
-2. Velcro pick&place with robot arm 
-Suggested Development: Pick up Velcro using the robotic arm and drop it off to a designated location
-- run the pickCVBlock.py, adjust the control algorithm for a smooth robotic motion
-
-3. Pick up 3D printed car part (Red Brake Caliper) using the robotic arm
-Suggested Developent: improve the vision detection for velcro tags so it is robust against the brake caliper's irregular shape
-- be aware the car parts might not be in the same color as the velcros!
-- consider: how should the gripper grip the calipers to be able to pick them up
-
-4. Detect a human hand in the camera frame
-Suggested Development: Modify the computer vision program to send an alert when a human hand is in frame
-- approaches can include basic color detection, movement tracking, or object detection
-
-5. Avoid a human hand while picking up the part (Red Brake Caliper)
-Suggested Development: think about how should the robot arm react to prevent collision with the human user. Is it stopping? Is it steering away? Is it something else?
-- determine how should the robot arm should be moving or controlled
-- determine if you should send a notification to the humans
-
- <img src="../assets/colab-rr.png" width="80%">
-
- ---
 
 ## Starter Material Introduction:
 Each team will be provided with the following equipment: 
@@ -58,18 +27,10 @@ The image below shows an example setup of the camera and the robot arm. This set
 
 Setup: 
 
-<img src="assets/IMG_6707.jpeg" width="20%">
-
 Clipping Camera Stand:
-
-<img src="assets/IMG_6706.jpeg" width="20%">
 
 Each team will also be provided with 3 red tags to run the starter code. Teams can also request for 3 printed car parts as a part of their development.
 
-<img src="assets/IMG_6708.jpeg" width="20%">
-
-# Introduction to Starter Source Code
-The code provided for you in this folder is intented to help you get started on the development. It contains a working pick-place script for the robot arm that takes in vision from the camera and uses a state machine for control.
 
 
 ## Must Read Before Use: Robot Arm Set Up & Safety Training
@@ -84,21 +45,6 @@ Please read through the safety operation procedure in [here](https://github.com/
 4. in dobotArm.py, ctrl+f to find `state = dType.ConnectDobot(api, "COM7", 115200)[0]`. Change the number after COM to reflect on the port you find
 5. disconnect from DobotLab
 5. if you every unplugged the robot arm, rerun the steps above the confirm the communication port is correct
-
-## camera calibration
-This script is needed for the camera to properly recognize where the red tags are located and connect the camera graphic to the robot's movement. 
-
-Note: if you are using a different camera as provided in the challenge, you need to run `calibrateCamera.py`. This requires you to have a 4x4 ArUco board -> or any other similar calibration tool.
-
-1. ensure camera is setup such that it can see the tabletop range the robot arm movement
-2. run getTransformationMatrix.py
-3. the robot will place its claw down to the table.You can place the red tag provided in between the gripper. try to ensure the centre of the strip is at the centre of the claw [show an image here]
-4. press space as instructed by the program
-5. the robot will move its claw away. now examine the camera graphic to ensure the tag is fully visible in the camera and not blocked by the arm. [image here]
-6. press space again to continue. the robot will repeat step 3-5 for more points, continue until the scrip finishes running
-
-## Robot Pick-Place Script
-a basic script implementing a detect part/pick place function has been provided to you as a starter code.Check the code comments to see what it does. Feel free to base your solution off of this script, or feel free to created something new!
 
 
 
